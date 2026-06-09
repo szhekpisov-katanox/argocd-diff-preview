@@ -1,0 +1,44 @@
+name: Publish to GHCR
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set env
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          echo "SHA=${SHA}" >> $GITHUB_ENV
+          BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          echo "BUILD_DATE=${BUILD_DATE}" >> $GITHUB_ENV
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          platforms: linux/amd64
+          build-args: |
+            VERSION=fork-infer
+            COMMIT=${{ env.SHA }}
+            BUILD_DATE=${{ env.BUILD_DATE }}
+          tags: ghcr.io/szhekpisov-katanox/argocd-diff-preview:fork-infer
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
