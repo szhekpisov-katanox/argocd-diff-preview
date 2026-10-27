@@ -112,6 +112,33 @@ func DeleteCluster(clusterName string, wait bool) {
 	}
 }
 
+// PrePullImages starts pulling images into every node of the cluster in the
+// background and returns immediately. A freshly created node takes a while to
+// become Ready, and Argo CD pods can't be scheduled until it is, so pulling in
+// the meantime takes the image download off the critical path. Failures are
+// only logged, since the kubelet pulls any missing image itself.
+func PrePullImages(clusterName string, images []string) {
+	go func() {
+		output, err := runCommand("kind", "get", "nodes", "--name", clusterName)
+		if err != nil {
+			log.Debug().Msgf("Skipping image pre-pull: failed to list nodes: %s", strings.TrimSpace(output))
+			return
+		}
+		for _, node := range strings.Fields(output) {
+			for _, image := range images {
+				go func() {
+					start := time.Now()
+					if out, err := runCommand("docker", "exec", node, "crictl", "pull", image); err != nil {
+						log.Debug().Msgf("Failed to pre-pull image %s on node %s: %s", image, node, strings.TrimSpace(out))
+						return
+					}
+					log.Debug().Msgf("Pre-pulled image %s on node %s in %s", image, node, time.Since(start).Round(time.Millisecond))
+				}()
+			}
+		}
+	}()
+}
+
 // runCommand executes a command and returns its output
 func runCommand(name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
@@ -147,4 +174,8 @@ func (k *Kind) ClusterExists() bool {
 
 func (k *Kind) DeleteCluster(wait bool) {
 	DeleteCluster(k.clusterName, wait)
+}
+
+func (k *Kind) PrePullImages(images []string) {
+	PrePullImages(k.clusterName, images)
 }

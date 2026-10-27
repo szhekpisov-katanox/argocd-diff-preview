@@ -16,7 +16,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"helm.sh/helm/v3/pkg/action"
+	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/chart/loader"
+	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/cli"
 	"helm.sh/helm/v3/pkg/cli/values"
 	"helm.sh/helm/v3/pkg/getter"
@@ -60,6 +62,9 @@ type ArgoCDInstallation struct {
 	operations        Operations // CLI or API implementation
 	RepoServerAddress string
 	embeddedRedis     bool
+	// PrePullImages, when set, is called with the Argo CD images the chart will
+	// run, before the chart is installed. It must not block.
+	PrePullImages func(images []string)
 }
 
 func New(client *k8s.Client, namespace string, version string, repoName string, repoURL string, repoUsername string, repoPassword string, loginOptions string, renderMode vars.RenderMethod, authToken string, configPath string, repoServerAddress string) *ArgoCDInstallation {
@@ -216,6 +221,15 @@ func (a *ArgoCDInstallation) installWithHelm() error {
 		return fmt.Errorf("failed to merge values: %w", err)
 	}
 	a.embeddedRedis = usesEmbeddedRedis(chartValues)
+
+	if a.PrePullImages != nil {
+		images, err := argocdImages(chart, chartValues, a.embeddedRedis)
+		if err != nil {
+			log.Debug().Err(err).Msg("Skipping image pre-pull: failed to resolve Argo CD images")
+		} else {
+			a.PrePullImages(images)
+		}
+	}
 
 	// look for 'createClusterRoles' in chartValues
 	if result, ok := chartValues["createClusterRoles"]; ok {
@@ -572,6 +586,44 @@ func (a *ArgoCDInstallation) EnsureArgoCdIsReady() error {
 	}
 
 	return nil
+}
+
+// argocdImages returns the Argo CD image, and the Redis image when the chart
+// runs its own Redis, based on the chart defaults merged with chartValues.
+func argocdImages(c *chart.Chart, chartValues map[string]any, embeddedRedis bool) ([]string, error) {
+	vals, err := chartutil.CoalesceValues(c, chartValues)
+	if err != nil {
+		return nil, err
+	}
+
+	var images []string
+	repository := valueString(vals, "global.image.repository")
+	tag := valueString(vals, "global.image.tag")
+	if tag == "" {
+		tag = c.Metadata.AppVersion
+	}
+	if repository != "" && tag != "" {
+		images = append(images, repository+":"+tag)
+	}
+
+	if embeddedRedis {
+		redisRepository := valueString(vals, "redis.image.repository")
+		redisTag := valueString(vals, "redis.image.tag")
+		if redisRepository != "" && redisTag != "" {
+			images = append(images, redisRepository+":"+redisTag)
+		}
+	}
+
+	return images, nil
+}
+
+func valueString(vals chartutil.Values, path string) string {
+	v, err := vals.PathValue(path)
+	if err != nil {
+		return ""
+	}
+	s, _ := v.(string)
+	return s
 }
 
 func usesEmbeddedRedis(values map[string]any) bool {

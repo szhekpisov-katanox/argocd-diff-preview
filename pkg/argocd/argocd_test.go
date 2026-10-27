@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	argocdconfig "github.com/dag-andersen/argocd-diff-preview/argocd-config"
+	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/cli"
 )
 
@@ -270,5 +271,58 @@ func assertNestedValue(t *testing.T, values map[string]any, want any, path ...st
 			return
 		}
 		t.Fatalf("path %v = %#v, want %#v", path, current, want)
+	}
+}
+
+func TestArgocdImages(t *testing.T) {
+	testChart := &chart.Chart{
+		Metadata: &chart.Metadata{Name: "argo-cd", AppVersion: "v3.5.6"},
+		Values: map[string]any{
+			"global": map[string]any{
+				"image": map[string]any{"repository": "quay.io/argoproj/argocd", "tag": ""},
+			},
+			"redis": map[string]any{
+				"image": map[string]any{"repository": "ecr-public.aws.com/docker/library/redis", "tag": "8.6.4-alpine"},
+			},
+		},
+	}
+
+	tests := []struct {
+		name          string
+		values        map[string]any
+		embeddedRedis bool
+		want          []string
+	}{
+		{
+			name:          "chart defaults use appVersion as tag",
+			values:        map[string]any{},
+			embeddedRedis: true,
+			want:          []string{"quay.io/argoproj/argocd:v3.5.6", "ecr-public.aws.com/docker/library/redis:8.6.4-alpine"},
+		},
+		{
+			name: "user overrides global image",
+			values: map[string]any{
+				"global": map[string]any{"image": map[string]any{"repository": "registry.example.com/argocd", "tag": "v3.5.7"}},
+			},
+			embeddedRedis: true,
+			want:          []string{"registry.example.com/argocd:v3.5.7", "ecr-public.aws.com/docker/library/redis:8.6.4-alpine"},
+		},
+		{
+			name:          "no redis image without embedded redis",
+			values:        map[string]any{},
+			embeddedRedis: false,
+			want:          []string{"quay.io/argoproj/argocd:v3.5.6"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := argocdImages(testChart, tt.values, tt.embeddedRedis)
+			if err != nil {
+				t.Fatalf("argocdImages() error = %v", err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("argocdImages() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"github.com/dag-andersen/argocd-diff-preview/pkg/fileparsing"
 	"github.com/dag-andersen/argocd-diff-preview/pkg/git"
 	"github.com/dag-andersen/argocd-diff-preview/pkg/k8s"
+	"github.com/dag-andersen/argocd-diff-preview/pkg/kind"
 	"github.com/dag-andersen/argocd-diff-preview/pkg/reposerverextract"
 	"github.com/dag-andersen/argocd-diff-preview/pkg/resource_filter"
 	"github.com/dag-andersen/argocd-diff-preview/pkg/utils"
@@ -212,6 +213,11 @@ func run(cfg *Config) error {
 		cfg.ArgocdConfigPath,
 		cfg.RepoServerAddress,
 	)
+
+	// Pull the Argo CD images into the new kind node while it is still becoming Ready
+	if kindProvider, ok := clusterProvider.(*kind.Kind); ok && cfg.CreateCluster {
+		argocd.PrePullImages = kindProvider.PrePullImages
+	}
 
 	// Ensure cleanup is performed when we exit (e.g., stopping port forwards)
 	defer argocd.Cleanup()
