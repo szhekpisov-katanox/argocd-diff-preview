@@ -20,7 +20,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 	"github.com/rs/zerolog/log"
@@ -126,6 +128,94 @@ func (helmChartPuller) Pull(source v1alpha1.ApplicationSource, creds *RepoCreds,
 		return "", fmt.Errorf("failed to locate pulled chart %q: %w", source.Chart, err)
 	}
 	return chartDir, nil
+}
+
+// cachingChartPuller wraps a chartPuller so each (repoURL, chart, version) is
+// pulled at most once per run. Applications commonly share a chart and differ
+// only in their value files, so without this every Application re-downloads
+// (and re-authenticates for) the same chart. Each caller still gets its own
+// copy of the chart under its destDir, since the chart must live inside the
+// tree that is streamed to the repo server.
+type cachingChartPuller struct {
+	inner    chartPuller
+	cacheDir string
+
+	mu      sync.Mutex
+	entries map[string]*cachedChart
+}
+
+type cachedChart struct {
+	mu       sync.Mutex
+	dir      string // pull destination for this entry, inside cacheDir
+	chartDir string // empty until a pull succeeds
+}
+
+// newCachingChartPuller returns a cachingChartPuller and a cleanup function
+// that removes the cached charts.
+func newCachingChartPuller(inner chartPuller) (*cachingChartPuller, func(), error) {
+	cacheDir, err := os.MkdirTemp("", "argocd-diff-preview-chart-cache-*")
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create chart cache dir: %w", err)
+	}
+	cleanup := func() {
+		if err := os.RemoveAll(cacheDir); err != nil {
+			log.Warn().Err(err).Str("dir", cacheDir).Msg("Failed to remove chart cache dir")
+		}
+	}
+	return &cachingChartPuller{inner: inner, cacheDir: cacheDir, entries: map[string]*cachedChart{}}, cleanup, nil
+}
+
+func (c *cachingChartPuller) Pull(source v1alpha1.ApplicationSource, creds *RepoCreds, destDir string) (string, error) {
+	cachedChartDir, cacheRoot, err := c.pullOnce(source, creds)
+	if err != nil {
+		return "", err
+	}
+
+	// Keep the same layout relative to destDir as the inner puller produces.
+	rel, err := filepath.Rel(cacheRoot, cachedChartDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to compute cached chart path: %w", err)
+	}
+	chartDir := filepath.Join(destDir, rel)
+	if err := copyDir(cachedChartDir, chartDir); err != nil {
+		return "", fmt.Errorf("failed to copy cached chart %q: %w", source.Chart, err)
+	}
+	return chartDir, nil
+}
+
+// pullOnce returns the cached chart directory for source, pulling it first if
+// no earlier pull succeeded. Concurrent callers for the same chart wait for a
+// single pull. Failed pulls are not cached, so the next caller retries.
+func (c *cachingChartPuller) pullOnce(source v1alpha1.ApplicationSource, creds *RepoCreds) (chartDir string, cacheRoot string, err error) {
+	key := strings.Join([]string{source.RepoURL, source.Chart, source.TargetRevision}, "\x00")
+
+	c.mu.Lock()
+	entry, ok := c.entries[key]
+	if !ok {
+		entry = &cachedChart{dir: filepath.Join(c.cacheDir, strconv.Itoa(len(c.entries)))}
+		c.entries[key] = entry
+	}
+	c.mu.Unlock()
+
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.chartDir != "" {
+		return entry.chartDir, entry.dir, nil
+	}
+
+	// Clear leftovers from an earlier failed pull.
+	if err := os.RemoveAll(entry.dir); err != nil {
+		return "", "", fmt.Errorf("failed to reset chart cache dir: %w", err)
+	}
+	if err := os.MkdirAll(entry.dir, 0o755); err != nil {
+		return "", "", fmt.Errorf("failed to create chart cache dir: %w", err)
+	}
+	chartDir, err = c.inner.Pull(source, creds, entry.dir)
+	if err != nil {
+		return "", "", err
+	}
+	entry.chartDir = chartDir
+	return entry.chartDir, entry.dir, nil
 }
 
 // findChartDir returns the directory under root that contains a Chart.yaml.

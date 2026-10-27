@@ -559,6 +559,12 @@ func (a *ArgoCDInstallation) EnsureArgoCdIsReady() error {
 		}
 	}
 
+	// The repo-server-api render method talks to the repo server directly and
+	// never goes through the application controller, so don't wait for it.
+	if a.RenderMethod() == vars.RenderMethodRepoServerAPI {
+		return nil
+	}
+
 	// The application controller is a StatefulSet by default. It depends on
 	// Redis and must be ready before rendering applications.
 	if err := a.K8sClient.WaitForWorkloadReady(a.Namespace, "app.kubernetes.io/component=application-controller,app.kubernetes.io/part-of=argocd", int(timeout.Seconds())); err != nil {

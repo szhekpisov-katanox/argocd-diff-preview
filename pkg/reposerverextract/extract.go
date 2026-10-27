@@ -143,6 +143,13 @@ func RenderApplicationsFromBothBranches(
 	}
 	defer repoClient.Cleanup()
 
+	// Pull each remote Helm chart once per run instead of once per Application.
+	puller, cleanupCharts, err := newCachingChartPuller(helmChartPuller{})
+	if err != nil {
+		return nil, nil, time.Since(startTime), err
+	}
+	defer cleanupCharts()
+
 	allApps := append(baseApps, targetApps...)
 
 	log.Info().Msgf("🤖 Rendering Applications via repo server (timeout in %d seconds)", timeout)
@@ -200,7 +207,7 @@ func RenderApplicationsFromBothBranches(
 			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(remainingTime())*time.Second)
 			defer cancel()
 
-			manifests, err := renderApp(ctx, repoClient, app, branchFolderByType, clusterScopedResources, creds, &repoSelector, kubeVersion, apiVersions, kustomizeBuildOptions, helmChartPuller{})
+			manifests, err := renderApp(ctx, repoClient, app, branchFolderByType, clusterScopedResources, creds, &repoSelector, kubeVersion, apiVersions, kustomizeBuildOptions, puller)
 			if err != nil {
 				results <- result{err: fmt.Errorf("failed to render app %s: %w", app.GetLongName(), err)}
 				return
