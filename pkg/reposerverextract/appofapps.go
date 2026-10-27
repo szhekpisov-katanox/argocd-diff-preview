@@ -208,6 +208,13 @@ func RenderApplicationsFromBothBranchesWithAppOfApps(
 	}
 	defer repoClient.Cleanup()
 
+	// Pull each remote Helm chart once per run instead of once per Application.
+	puller, cleanupCharts, err := newCachingChartPuller(helmChartPuller{})
+	if err != nil {
+		return nil, nil, time.Since(startTime), err
+	}
+	defer cleanupCharts()
+
 	log.Info().Msgf("🤖 Rendering Applications via repo server with app-of-apps traversal (timeout in %d seconds)", timeout)
 
 	remainingTime := func() int {
@@ -367,7 +374,7 @@ func RenderApplicationsFromBothBranchesWithAppOfApps(
 			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(remainingTime())*time.Second)
 			defer cancel()
 
-			manifests, childApps, err := renderAppWithChildDiscovery(ctx, repoClient, argocd, item.app, branchFolderByType, branchByType, clusterScopedResources, creds, &repoSelector, argocd.Namespace, tempFolder, item.depth, kubeVersion, apiVersions, kustomizeBuildOptions, redirectRevisions)
+			manifests, childApps, err := renderAppWithChildDiscovery(ctx, repoClient, argocd, item.app, branchFolderByType, branchByType, clusterScopedResources, creds, &repoSelector, argocd.Namespace, tempFolder, item.depth, kubeVersion, apiVersions, kustomizeBuildOptions, redirectRevisions, puller)
 			if err != nil {
 				results <- renderResult{err: fmt.Errorf("failed to render app %s: %w", item.app.GetLongName(), err)}
 				return
@@ -459,8 +466,9 @@ func renderAppWithChildDiscovery(
 	apiVersions []string,
 	kustomizeBuildOptions string,
 	redirectRevisions []string,
+	puller chartPuller,
 ) ([]unstructured.Unstructured, []argoapplication.ArgoResource, error) {
-	allManifests, err := renderApp(ctx, repoClient, app, branchFolderByType, clusterScopedResources, creds, repoSelector, kubeVersion, apiVersions, kustomizeBuildOptions, helmChartPuller{})
+	allManifests, err := renderApp(ctx, repoClient, app, branchFolderByType, clusterScopedResources, creds, repoSelector, kubeVersion, apiVersions, kustomizeBuildOptions, puller)
 	if err != nil {
 		return nil, nil, err
 	}
