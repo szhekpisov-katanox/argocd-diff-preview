@@ -124,7 +124,7 @@ func PrePullImages(clusterName string, images []string) {
 			log.Debug().Msgf("Skipping image pre-pull: failed to list nodes: %s", strings.TrimSpace(output))
 			return
 		}
-		for _, node := range strings.Fields(output) {
+		for node := range strings.FieldsSeq(output) {
 			for _, image := range images {
 				go func() {
 					start := time.Now()
