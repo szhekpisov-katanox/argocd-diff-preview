@@ -210,6 +210,7 @@ func run(cfg *Config) error {
 		cfg.RenderMethod,
 		cfg.ArgocdAuthToken,
 		cfg.ArgocdConfigPath,
+		cfg.RepoServerAddress,
 	)
 
 	// Ensure cleanup is performed when we exit (e.g., stopping port forwards)
@@ -218,7 +219,7 @@ func run(cfg *Config) error {
 	var argocdInstallationDuration time.Duration
 	if cfg.CreateCluster {
 		// Install Argo CD
-		duration, err := argocd.Install(cfg.Debug, cfg.SecretsFolder)
+		duration, err := argocd.Install(cfg.Debug, cfg.PreinstallFolder, cfg.SecretsFolder)
 		if err != nil {
 			log.Error().Msgf("❌ Failed to install Argo CD")
 			return err
@@ -368,6 +369,11 @@ func run(cfg *Config) error {
 		return err
 	}
 
+	if !cfg.IncludeHelmHooks {
+		baseManifests = extract.RemoveHelmHooks(baseManifests)
+		targetManifests = extract.RemoveHelmHooks(targetManifests)
+	}
+
 	// Create info box for storing run time information
 	statsInfo := diff.StatsInfo{
 		FullDuration:               time.Since(startTime),
@@ -452,7 +458,7 @@ func writeManifests(
 		if perApp {
 			// Always write the file, even if content is empty, so the user can see that
 			// an application existed but had no rendered output.
-			filePath := fmt.Sprintf("%s/%s", perAppFolder, app.Id)
+			filePath := fmt.Sprintf("%s/%s.yaml", perAppFolder, app.Id)
 			if err := utils.WriteFile(filePath, content); err != nil {
 				return fmt.Errorf("failed to write manifest for app %s: %w", app.Name, err)
 			}

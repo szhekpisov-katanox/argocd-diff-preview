@@ -22,8 +22,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
@@ -35,6 +35,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/yaml"
 )
 
@@ -78,6 +79,29 @@ func assertDefaultProjectFields(t *testing.T, req *repoapiclient.ManifestRequest
 	t.Helper()
 	assert.Equal(t, "default", req.ProjectName, "project name must match the patched application project")
 	assert.Equal(t, []string{"*"}, req.ProjectSourceRepos, "source repos must be permissive so helm build errors are not masked as permission errors")
+}
+
+func TestNormalizeNamespacesDeduplicatesClusterScopedResourcesWithoutDestinationNamespace(t *testing.T) {
+	first := unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "rbac.authorization.k8s.io/v1",
+		"kind":       "ClusterRole",
+		"metadata": map[string]any{
+			"name": "node-reader",
+		},
+		"rules": []any{map[string]any{"verbs": []any{"get"}}},
+	}}
+	last := first.DeepCopy()
+	last.Object["rules"] = []any{map[string]any{"verbs": []any{"get", "list"}}}
+
+	result, err := normalizeNamespaces(
+		[]unstructured.Unstructured{first, *last},
+		"",
+		map[schema.GroupKind]bool{{Group: "rbac.authorization.k8s.io", Kind: "ClusterRole"}: true},
+		"test-app",
+	)
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+	assert.Equal(t, last.Object, result[0].Object, "Argo CD deduplication should keep the last resource")
 }
 
 func testRepoSelector(t *testing.T, repo string) *repository.Selector {
@@ -175,7 +199,56 @@ spec:
 	assert.Equal(t, kubeVersion, req.KubeVersion)
 	assert.Equal(t, apiVersions, req.ApiVersions)
 	assert.Nil(t, req.RefSources)
+	assert.Nil(t, req.KustomizeOptions, "no build options configured: field must stay unset")
 	assertDefaultProjectFields(t, req)
+}
+
+// Global kustomize build options from argocd-cm (e.g. --load-restrictor LoadRestrictionsNone)
+// must reach the repo server on every request, exactly like Argo CD's API server passes them;
+// the repo server never reads the ConfigMap itself.
+func TestBuildManifestRequest_KustomizeBuildOptions(t *testing.T) {
+	branchFolder := makeBranchFolder(t, "apps/my-app")
+
+	app := makeApp(t, `
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: my-app
+spec:
+  destination:
+    namespace: production
+  source:
+    repoURL: https://github.com/org/repo.git
+    path: apps/my-app
+    targetRevision: HEAD
+`)
+
+	contentSources, refSources, hasMultipleSources, err := splitSources(app)
+	require.NoError(t, err)
+	require.Len(t, contentSources, 1)
+
+	buildOptions := "--enable-alpha-plugins --enable-exec --load-restrictor LoadRestrictionsNone"
+	req, _, cleanup, err := buildManifestRequestForSource(
+		app,
+		contentSources[0],
+		refSources,
+		hasMultipleSources,
+		branchFolder,
+		nil,
+		manifestRequestRenderContext{
+			repoSelector:          testRepoSelector(t, ""),
+			kubeVersion:           "v1.30.1",
+			apiVersions:           []string{"apps/v1", "v1"},
+			kustomizeBuildOptions: buildOptions,
+		},
+	)
+	require.NoError(t, err)
+	if cleanup != nil {
+		defer cleanup()
+	}
+
+	require.NotNil(t, req.KustomizeOptions)
+	assert.Equal(t, buildOptions, req.KustomizeOptions.BuildOptions)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -308,6 +381,102 @@ spec:
 	assertDefaultProjectFields(t, req)
 }
 
+func TestBuildManifestRequest_MatchingPRRepoMissingLocalPath_UsesRemoteRPC(t *testing.T) {
+	branchFolder := t.TempDir()
+	// Simulate a resource-repo pipeline where the branch folder contains the
+	// Application repository checkout, not the PR resource repository files.
+	require.NoError(t, os.MkdirAll(filepath.Join(branchFolder, "clusters", "preview", "applicationsets"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(branchFolder, "clusters", "preview", "applicationsets", "apps.yaml"), []byte("kind: ApplicationSet\n"), 0o644))
+
+	app := makeApp(t, `
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: preview-worker
+spec:
+  destination:
+    namespace: workers
+  source:
+    repoURL: https://github.com/example/resource-config.git
+    path: environments/preview/apps/worker
+    targetRevision: HEAD
+`)
+
+	contentSources, refSources, hasMultipleSources, err := splitSources(app)
+	require.NoError(t, err)
+	require.Len(t, contentSources, 1)
+	require.Empty(t, refSources)
+
+	req, streamDir, cleanup, err := buildManifestRequestForSource(app, contentSources[0], refSources, hasMultipleSources, branchFolder, nil, manifestRequestRenderContext{
+		repoSelector: testRepoSelector(t, "example/resource-config"),
+	})
+	require.NoError(t, err)
+	if cleanup != nil {
+		defer cleanup()
+	}
+
+	assert.Empty(t, streamDir, "missing local PR repo source path should fall back to remote RPC")
+	assert.Equal(t, "https://github.com/example/resource-config.git", req.Repo.Repo)
+	assert.Equal(t, "environments/preview/apps/worker", req.ApplicationSource.Path)
+	assert.Nil(t, req.RefSources)
+	assertDefaultProjectFields(t, req)
+}
+
+func TestBuildManifestRequest_ExternalChart_WithMissingLocalRefValueFile_UsesRemoteRPC(t *testing.T) {
+	branchFolder := t.TempDir()
+	// Simulate a resource-repo pipeline where $local points at the PR repo, but the
+	// local checkout is the Application repository and lacks resource values.
+	require.NoError(t, os.MkdirAll(filepath.Join(branchFolder, "clusters", "preview", "applicationsets"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(branchFolder, "clusters", "preview", "applicationsets", "charts-from-list.yaml"), []byte("kind: ApplicationSet\n"), 0o644))
+
+	app := makeApp(t, `
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: preview-cache
+spec:
+  destination:
+    namespace: cache
+  sources:
+    - repoURL: https://github.com/example/resource-config.git
+      targetRevision: HEAD
+      ref: local
+    - chart: redis
+      repoURL: https://charts.example.invalid
+      targetRevision: 1.2.3
+      helm:
+        valueFiles:
+          - $local/environments/preview/charts/values/redis.yaml
+`)
+
+	contentSources, refSources, hasMultipleSources, err := splitSources(app)
+	require.NoError(t, err)
+	require.Len(t, contentSources, 1)
+	require.Len(t, refSources, 1)
+	puller := &fakeChartPuller{}
+
+	req, streamDir, cleanup, err := buildManifestRequestForSource(app, contentSources[0], refSources, hasMultipleSources, branchFolder, nil, manifestRequestRenderContext{
+		repoSelector: testRepoSelector(t, "example/resource-config"),
+		puller:       puller,
+	})
+	require.NoError(t, err)
+	if cleanup != nil {
+		defer cleanup()
+	}
+
+	assert.Empty(t, streamDir, "missing local PR repo ref value file should fall back to remote RPC")
+	assert.Empty(t, puller.pulled, "remote fallback should not pull and stream the chart locally")
+	assert.Equal(t, "redis", req.ApplicationSource.Chart)
+	require.NotNil(t, req.ApplicationSource.Helm)
+	assert.Equal(t, []string{"$local/environments/preview/charts/values/redis.yaml"}, req.ApplicationSource.Helm.ValueFiles)
+	require.NotNil(t, req.RefSources)
+	refTarget, ok := req.RefSources["$local"]
+	require.True(t, ok)
+	assert.Equal(t, "https://github.com/example/resource-config.git", refTarget.Repo.Repo)
+	assert.Equal(t, "HEAD", refTarget.TargetRevision)
+	assertDefaultProjectFields(t, req)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 4.  Multi-source with ref AND a local chart (slow path: temp dir + streaming)
 //
@@ -331,6 +500,9 @@ func TestBuildManifestRequest_MultiSource_LocalChart_WithRef_RewritesValueFiles(
 	// The ref-only source has no path (points at repo root), so we put the
 	// values file at the repo root level inside the branch folder.
 	require.NoError(t, os.WriteFile(filepath.Join(branchFolder, "values-prod.yaml"), []byte("replicas: 3\n"), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(branchFolder, "secrets"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(branchFolder, "secrets", "token.txt"), []byte("token\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(branchFolder, "unrelated.yaml"), []byte("ignored: true\n"), 0o644))
 
 	app := makeApp(t, `
 apiVersion: argoproj.io/v1alpha1
@@ -350,6 +522,9 @@ spec:
       helm:
         valueFiles:
           - $cfg/values-prod.yaml
+        fileParameters:
+          - name: auth.token
+            path: $cfg/secrets/token.txt
 `)
 
 	contentSources, refSources, hasMultipleSources, err := splitSources(app)
@@ -381,7 +556,62 @@ spec:
 	absValueFile = filepath.Clean(absValueFile)
 	_, statErr := os.Stat(absValueFile)
 	assert.NoError(t, statErr, "rewritten value file path %q should exist on disk", absValueFile)
+	assert.NoFileExists(t, filepath.Join(streamDir, ".refs", "cfg", "unrelated.yaml"), "only referenced files should be staged")
+	require.Len(t, req.ApplicationSource.Helm.FileParameters, 1)
+	fileParameter := req.ApplicationSource.Helm.FileParameters[0]
+	assert.NotContains(t, fileParameter.Path, "$", "file parameter path must be rewritten")
+	assert.FileExists(t, filepath.Join(streamDir, "apps", "my-chart", fileParameter.Path))
 	assertDefaultProjectFields(t, req)
+}
+
+// Multi-source: a kustomize content source referencing a directory outside its
+// own path must stream the existing checkout, like the no-refs path. Besides
+// keeping the referenced directory available, reusing this path lets the tgz
+// cache share one compressed checkout across applications.
+func TestBuildManifestRequest_MultiSource_Kustomize_WithRef_StreamsBranchRoot(t *testing.T) {
+	branchFolder := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(branchFolder, "clusters", "dev", "my-app"), 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(branchFolder, "clusters", "dev", "my-app", "kustomization.yaml"),
+		[]byte("resources:\n  - ../../../base/my-app\n"), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(branchFolder, "base", "my-app"), 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(branchFolder, "base", "my-app", "kustomization.yaml"),
+		[]byte("resources: []\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(branchFolder, "values.yaml"), []byte("a: 1\n"), 0o644))
+
+	app := makeApp(t, `
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: my-app-dev
+spec:
+  destination:
+    namespace: production
+  sources:
+    - repoURL: https://github.com/org/repo.git
+      ref: values
+      targetRevision: HEAD
+    - repoURL: https://github.com/org/repo.git
+      path: clusters/dev/my-app
+      targetRevision: HEAD
+`)
+
+	contentSources, refSources, hasMultipleSources, err := splitSources(app)
+	require.NoError(t, err)
+	require.Len(t, contentSources, 1)
+	require.Len(t, refSources, 1)
+
+	req, streamDir, cleanup, err := buildManifestRequestForSource(app, contentSources[0], refSources, hasMultipleSources, branchFolder, nil, manifestRequestRenderContext{
+		repoSelector: testRepoSelector(t, ""),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, branchFolder, streamDir)
+	assert.Nil(t, cleanup)
+
+	assert.Equal(t, "clusters/dev/my-app", req.ApplicationSource.Path)
+	_, statErr := os.Stat(filepath.Join(streamDir, "base", "my-app", "kustomization.yaml"))
+	assert.NoError(t, statErr, "directories referenced outside the kustomize source path must remain available")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -394,6 +624,56 @@ spec:
 //	  "source referenced "$values", but no source has a 'ref' field defined"
 //
 // ─────────────────────────────────────────────────────────────────────────────
+func TestResolveRefFilePathRejectsTraversal(t *testing.T) {
+	_, _, err := resolveRefFilePath(t.TempDir(), "../outside.yaml")
+	require.ErrorContains(t, err, "escapes")
+}
+
+func TestStageRefSourcesRejectsMalformedRefPath(t *testing.T) {
+	_, err := stageRefSources(t.TempDir(), t.TempDir(), []v1alpha1.ApplicationSource{{Ref: "values"}}, v1alpha1.ApplicationSource{
+		Helm: &v1alpha1.ApplicationSourceHelm{ValueFiles: []string{"$values"}},
+	})
+	require.ErrorContains(t, err, "invalid ref path")
+}
+
+func TestStageRefSourcesDeduplicatesStaticPaths(t *testing.T) {
+	branchFolder := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(branchFolder, "values.yaml"), []byte("replicas: 2\n"), 0o644))
+
+	refDirs, err := stageRefSources(t.TempDir(), branchFolder, []v1alpha1.ApplicationSource{{Ref: "values"}}, v1alpha1.ApplicationSource{
+		Helm: &v1alpha1.ApplicationSourceHelm{
+			ValueFiles:     []string{"$values/values.yaml", "$values/values.yaml"},
+			FileParameters: []v1alpha1.HelmFileParameter{{Name: "copy", Path: "$values/values.yaml"}},
+		},
+	})
+	require.NoError(t, err)
+	assert.FileExists(t, filepath.Join(refDirs["values"], "values.yaml"))
+}
+
+func TestStageRefSourcesDoesNotIgnoreMissingFileParameter(t *testing.T) {
+	_, err := stageRefSources(t.TempDir(), t.TempDir(), []v1alpha1.ApplicationSource{{Ref: "values"}}, v1alpha1.ApplicationSource{
+		Helm: &v1alpha1.ApplicationSourceHelm{
+			IgnoreMissingValueFiles: true,
+			FileParameters:          []v1alpha1.HelmFileParameter{{Name: "required", Path: "$values/missing.txt"}},
+		},
+	})
+	require.ErrorContains(t, err, "missing.txt")
+}
+
+func TestStageRefSourcesFallsBackForDynamicPaths(t *testing.T) {
+	branchFolder := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(branchFolder, "environments"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(branchFolder, "environments", "my-app.yaml"), []byte("replicas: 2\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(branchFolder, "unrelated.yaml"), []byte("present: true\n"), 0o644))
+
+	refDirs, err := stageRefSources(t.TempDir(), branchFolder, []v1alpha1.ApplicationSource{{Ref: "values"}}, v1alpha1.ApplicationSource{
+		Helm: &v1alpha1.ApplicationSourceHelm{ValueFiles: []string{"$values/environments/$ARGOCD_APP_NAME.yaml"}},
+	})
+	require.NoError(t, err)
+	assert.FileExists(t, filepath.Join(refDirs["values"], "environments", "my-app.yaml"))
+	assert.FileExists(t, filepath.Join(refDirs["values"], "unrelated.yaml"), "dynamic paths must preserve full-ref staging")
+}
+
 func TestBuildManifestRequest_ExternalChart_WithRefAndPath_GH401(t *testing.T) {
 	// Exact reproduction of https://github.com/dag-andersen/argocd-diff-preview/issues/401
 	//
@@ -1600,6 +1880,8 @@ func TestCopyDir_FollowsDirectorySymlink(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(chart, "files"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(chart, "Chart.yaml"), []byte("name: c\n"), 0o644))
 	require.NoError(t, os.Symlink(external, filepath.Join(chart, "files", "sql")))
+	require.NoError(t, os.MkdirAll(filepath.Join(chart, ".git"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(chart, ".git", "config"), []byte("[core]\n"), 0o644))
 
 	dst := filepath.Join(root, "dst")
 	require.NoError(t, copyDir(chart, dst))
@@ -1609,4 +1891,5 @@ func TestCopyDir_FollowsDirectorySymlink(t *testing.T) {
 	got, err := os.ReadFile(filepath.Join(dst, "files", "sql", "V1__init.sql"))
 	require.NoError(t, err)
 	assert.Equal(t, "SELECT 1;", string(got))
+	assert.NoDirExists(t, filepath.Join(dst, ".git"), "Git metadata must not be copied into staging directories")
 }

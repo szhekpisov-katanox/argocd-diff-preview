@@ -17,7 +17,7 @@ func TestNormalizeNamespaces(t *testing.T) {
 		name                     string
 		manifests                []unstructured.Unstructured
 		destNamespace            string
-		namespacedResources      map[schema.GroupKind]bool
+		clusterScopedResources   map[schema.GroupKind]bool
 		appName                  string
 		expectedNamespaces       []string          // expected namespace for each manifest (for ordered tests)
 		expectedNamespacesByName map[string]string // expected namespace by resource name (for unordered tests)
@@ -37,12 +37,10 @@ func TestNormalizeNamespaces(t *testing.T) {
 					},
 				},
 			},
-			namespacedResources: map[schema.GroupKind]bool{
-				{Group: "", Kind: "ConfigMap"}: true,
-			},
-			appName:            "test-app",
-			expectedNamespaces: []string{""}, // unchanged
-			expectError:        false,
+			clusterScopedResources: map[schema.GroupKind]bool{},
+			appName:                "test-app",
+			expectedNamespaces:     []string{""}, // unchanged
+			expectError:            false,
 		},
 		{
 			name:          "adds namespace to namespaced resource without namespace",
@@ -58,12 +56,10 @@ func TestNormalizeNamespaces(t *testing.T) {
 					},
 				},
 			},
-			namespacedResources: map[schema.GroupKind]bool{
-				{Group: "", Kind: "ConfigMap"}: true,
-			},
-			appName:            "test-app",
-			expectedNamespaces: []string{"target-ns"},
-			expectError:        false,
+			clusterScopedResources: map[schema.GroupKind]bool{},
+			appName:                "test-app",
+			expectedNamespaces:     []string{"target-ns"},
+			expectError:            false,
 		},
 		{
 			name:          "preserves existing namespace on namespaced resource",
@@ -80,12 +76,10 @@ func TestNormalizeNamespaces(t *testing.T) {
 					},
 				},
 			},
-			namespacedResources: map[schema.GroupKind]bool{
-				{Group: "", Kind: "ConfigMap"}: true,
-			},
-			appName:            "test-app",
-			expectedNamespaces: []string{"existing-ns"},
-			expectError:        false,
+			clusterScopedResources: map[schema.GroupKind]bool{},
+			appName:                "test-app",
+			expectedNamespaces:     []string{"existing-ns"},
+			expectError:            false,
 		},
 		{
 			name:          "clears namespace from cluster-scoped resource",
@@ -102,8 +96,8 @@ func TestNormalizeNamespaces(t *testing.T) {
 					},
 				},
 			},
-			namespacedResources: map[schema.GroupKind]bool{
-				{Group: "", Kind: "Namespace"}: false, // cluster-scoped
+			clusterScopedResources: map[schema.GroupKind]bool{
+				{Group: "", Kind: "Namespace"}: true,
 			},
 			appName:            "test-app",
 			expectedNamespaces: []string{""}, // cleared
@@ -142,10 +136,8 @@ func TestNormalizeNamespaces(t *testing.T) {
 					},
 				},
 			},
-			namespacedResources: map[schema.GroupKind]bool{
-				{Group: "", Kind: "ConfigMap"}:                            true,
-				{Group: "", Kind: "Secret"}:                               true,
-				{Group: "rbac.authorization.k8s.io", Kind: "ClusterRole"}: false, // cluster-scoped
+			clusterScopedResources: map[schema.GroupKind]bool{
+				{Group: "rbac.authorization.k8s.io", Kind: "ClusterRole"}: true,
 			},
 			appName: "test-app",
 			// Note: DeduplicateTargetObjects may reorder manifests, so we check by name->namespace map
@@ -157,21 +149,19 @@ func TestNormalizeNamespaces(t *testing.T) {
 			expectError: false,
 		},
 		{
-			name:          "empty manifests slice returns empty slice",
-			destNamespace: "target-ns",
-			manifests:     []unstructured.Unstructured{},
-			namespacedResources: map[schema.GroupKind]bool{
-				{Group: "", Kind: "ConfigMap"}: true,
-			},
-			appName:            "test-app",
-			expectedNamespaces: []string{},
-			expectError:        false,
+			name:                   "empty manifests slice returns empty slice",
+			destNamespace:          "target-ns",
+			manifests:              []unstructured.Unstructured{},
+			clusterScopedResources: map[schema.GroupKind]bool{},
+			appName:                "test-app",
+			expectedNamespaces:     []string{},
+			expectError:            false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := normalizeNamespaces(tt.manifests, tt.destNamespace, tt.namespacedResources, tt.appName)
+			result, err := normalizeNamespaces(tt.manifests, tt.destNamespace, tt.clusterScopedResources, tt.appName)
 
 			if tt.expectError {
 				assert.Error(t, err)
@@ -199,6 +189,67 @@ func TestNormalizeNamespaces(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNormalizeNamespacesPreservesSameNamedUnknownResources(t *testing.T) {
+	manifests := make([]unstructured.Unstructured, 0, 3)
+	for _, namespace := range []string{"ns-a", "ns-b", "ns-c"} {
+		manifests = append(manifests, unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "external-secrets.io/v1",
+			"kind":       "ExternalSecret",
+			"metadata": map[string]any{
+				"name":      "my-secret",
+				"namespace": namespace,
+			},
+		}})
+	}
+
+	result, err := normalizeNamespaces(manifests, "default", map[schema.GroupKind]bool{}, "test-app")
+	require.NoError(t, err)
+	require.Len(t, result, 3)
+
+	actualNamespaces := make([]string, 0, len(result))
+	for _, manifest := range result {
+		actualNamespaces = append(actualNamespaces, manifest.GetNamespace())
+	}
+	assert.ElementsMatch(t, []string{"ns-a", "ns-b", "ns-c"}, actualNamespaces)
+}
+
+func TestNormalizeNamespacesDeduplicatesClusterScopedResourcesWithoutDestinationNamespace(t *testing.T) {
+	first := unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "rbac.authorization.k8s.io/v1",
+		"kind":       "ClusterRole",
+		"metadata": map[string]any{
+			"name": "node-reader",
+		},
+		"rules": []any{map[string]any{"verbs": []any{"get"}}},
+	}}
+	last := first.DeepCopy()
+	last.Object["rules"] = []any{map[string]any{"verbs": []any{"get", "list"}}}
+
+	result, err := normalizeNamespaces(
+		[]unstructured.Unstructured{first, *last},
+		"",
+		map[schema.GroupKind]bool{{Group: "rbac.authorization.k8s.io", Kind: "ClusterRole"}: true},
+		"test-app",
+	)
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+	assert.Equal(t, last.Object, result[0].Object, "Argo CD deduplication should keep the last resource")
+}
+
+func TestResourceInfoProviderDefaultsUnknownKindsToNamespaced(t *testing.T) {
+	provider := &resourceInfoProvider{clusterScopedByGk: map[schema.GroupKind]bool{
+		{Group: "rbac.authorization.k8s.io", Kind: "ClusterRole"}: true,
+	}}
+
+	namespaced, err := provider.IsNamespaced(schema.GroupKind{Group: "external-secrets.io", Kind: "ExternalSecret"})
+	require.NoError(t, err)
+	assert.True(t, namespaced)
+
+	namespaced, err = provider.IsNamespaced(schema.GroupKind{Group: "rbac.authorization.k8s.io", Kind: "ClusterRole"})
+	require.NoError(t, err)
+	assert.False(t, namespaced)
 }
 
 func TestVerifyNoDuplicateAppIds(t *testing.T) {
@@ -408,4 +459,50 @@ func TestApplicationSetGeneratedDuplicateNamesAreNormalizedBeforeExtract(t *test
 		yamlNames := []string{normalized[0].Yaml.GetName(), normalized[1].Yaml.GetName()}
 		assert.ElementsMatch(t, []string{"pr123-t-dupe-1", "pr123-t-dupe-2"}, yamlNames)
 	})
+}
+
+func TestRemoveHelmHooks(t *testing.T) {
+	resource := func(name string, annotations map[string]any) unstructured.Unstructured {
+		metadata := map[string]any{"name": name}
+		if annotations != nil {
+			metadata["annotations"] = annotations
+		}
+		return unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "v1",
+			"kind":       "Pod",
+			"metadata":   metadata,
+		}}
+	}
+
+	apps := []ExtractedApp{
+		{
+			Id:   "app-1",
+			Name: "app-1",
+			Manifests: []unstructured.Unstructured{
+				resource("plain", nil),
+				resource("annotated", map[string]any{"example.com/note": "x"}),
+				resource("pre-upgrade", map[string]any{"helm.sh/hook": "pre-upgrade"}),
+				resource("test", map[string]any{"helm.sh/hook": "test"}),
+			},
+			Branch: git.Target,
+		},
+		{
+			Id:        "app-2",
+			Name:      "app-2",
+			Manifests: []unstructured.Unstructured{resource("only-hook", map[string]any{"helm.sh/hook": "post-install"})},
+			Branch:    git.Target,
+		},
+	}
+
+	result := RemoveHelmHooks(apps)
+
+	require.Len(t, result, 2)
+	names := make([]string, 0, len(result[0].Manifests))
+	for _, m := range result[0].Manifests {
+		names = append(names, m.GetName())
+	}
+	assert.Equal(t, []string{"plain", "annotated"}, names)
+	assert.Equal(t, "app-2", result[1].Id)
+	assert.Empty(t, result[1].Manifests)
+	assert.Len(t, apps[0].Manifests, 4, "the input applications must not be modified")
 }

@@ -20,6 +20,7 @@ import (
 
 	"github.com/dag-andersen/argocd-diff-preview/pkg/app_selector"
 	"github.com/dag-andersen/argocd-diff-preview/pkg/cluster"
+	"github.com/dag-andersen/argocd-diff-preview/pkg/git"
 	"github.com/dag-andersen/argocd-diff-preview/pkg/k3d"
 	"github.com/dag-andersen/argocd-diff-preview/pkg/kind"
 	"github.com/dag-andersen/argocd-diff-preview/pkg/minikube"
@@ -53,6 +54,7 @@ var (
 	DefaultBaseBranch                           = "main"
 	DefaultOutputFolder                         = "./output"
 	DefaultSecretsFolder                        = "./secrets"
+	DefaultPreinstallFolder                     = "./preinstall"
 	DefaultCluster                              = "auto"
 	DefaultClusterName                          = "argocd-diff-preview"
 	DefaultKindOptions                          = ""
@@ -85,9 +87,11 @@ var (
 	DefaultArgocdConfigPath                     = "./argocd-config"
 	DefaultOutputAppManifests                   = false
 	DefaultOutputBranchManifests                = false
+	DefaultIncludeHelmHooks                     = false
 	DefaultTraverseAppOfApps                    = false
 	DefaultFailOnDuplicateGeneratedApplications = false
 	DefaultSkipAppSetGenerationErrors           = false
+	DefaultRepoServerAddress                    = ""
 )
 
 // RawOptions holds the raw CLI/env inputs - used only for parsing
@@ -104,6 +108,7 @@ type RawOptions struct {
 	RepoRegex                            string `mapstructure:"repo-regex"`
 	OutputFolder                         string `mapstructure:"output-folder"`
 	SecretsFolder                        string `mapstructure:"secrets-folder"`
+	PreinstallFolder                     string `mapstructure:"preinstall-folder"`
 	CreateCluster                        bool   `mapstructure:"create-cluster"`
 	ClusterType                          string `mapstructure:"cluster"`
 	ClusterName                          string `mapstructure:"cluster-name"`
@@ -138,9 +143,11 @@ type RawOptions struct {
 	Concurrency                          uint   `mapstructure:"concurrency"`
 	OutputAppManifests                   bool   `mapstructure:"output-app-manifests"`
 	OutputBranchManifests                bool   `mapstructure:"output-branch-manifests"`
+	IncludeHelmHooks                     bool   `mapstructure:"include-helm-hooks"`
 	TraverseAppOfApps                    bool   `mapstructure:"traverse-app-of-apps"`
 	FailOnDuplicateGeneratedApplications bool   `mapstructure:"fail-on-duplicate-generated-applications"`
 	SkipAppSetGenerationErrors           bool   `mapstructure:"skip-appset-generation-errors"`
+	RepoServerAddress                    string `mapstructure:"repo-server-address"`
 }
 
 // Config is the final, validated, ready-to-use configuration
@@ -156,6 +163,7 @@ type Config struct {
 	RepoSelector                         repository.Selector
 	OutputFolder                         string
 	SecretsFolder                        string
+	PreinstallFolder                     string
 	CreateCluster                        bool
 	ClusterName                          string
 	KindOptions                          string
@@ -185,9 +193,11 @@ type Config struct {
 	Concurrency                          uint
 	OutputAppManifests                   bool
 	OutputBranchManifests                bool
+	IncludeHelmHooks                     bool
 	TraverseAppOfApps                    bool
 	FailOnDuplicateGeneratedApplications bool
 	SkipAppSetGenerationErrors           bool
+	RepoServerAddress                    string
 
 	// Parsed/processed fields - no "parsed" prefix needed
 	FileRegex           *regexp.Regexp
@@ -257,6 +267,7 @@ func Parse() *Config {
 	viper.SetDefault("base-branch", DefaultBaseBranch)
 	viper.SetDefault("output-folder", DefaultOutputFolder)
 	viper.SetDefault("secrets-folder", DefaultSecretsFolder)
+	viper.SetDefault("preinstall-folder", DefaultPreinstallFolder)
 	viper.SetDefault("create-cluster", DefaultCreateCluster)
 	viper.SetDefault("watch-if-no-watch-pattern-found", DefaultWatchIfNoWatchPatternFound)
 	viper.SetDefault("infer-app-dependencies", DefaultInferAppDependencies)
@@ -284,9 +295,11 @@ func Parse() *Config {
 	viper.SetDefault("argocd-config-dir", DefaultArgocdConfigPath)
 	viper.SetDefault("output-app-manifests", DefaultOutputAppManifests)
 	viper.SetDefault("output-branch-manifests", DefaultOutputBranchManifests)
+	viper.SetDefault("include-helm-hooks", DefaultIncludeHelmHooks)
 	viper.SetDefault("traverse-app-of-apps", DefaultTraverseAppOfApps)
 	viper.SetDefault("fail-on-duplicate-generated-applications", DefaultFailOnDuplicateGeneratedApplications)
 	viper.SetDefault("skip-appset-generation-errors", DefaultSkipAppSetGenerationErrors)
+	viper.SetDefault("repo-server-address", DefaultRepoServerAddress)
 
 	// Basic flags
 	rootCmd.Flags().BoolP("debug", "d", false, "Activate debug mode")
@@ -319,6 +332,7 @@ func Parse() *Config {
 	// Folders
 	rootCmd.Flags().StringP("output-folder", "o", DefaultOutputFolder, "Output folder where the diff will be saved")
 	rootCmd.Flags().StringP("secrets-folder", "s", DefaultSecretsFolder, "Secrets folder where the secrets are read from")
+	rootCmd.Flags().String("preinstall-folder", DefaultPreinstallFolder, "Folder containing Kubernetes manifests to apply before Argo CD is installed")
 
 	// Cluster related
 	rootCmd.Flags().Bool("create-cluster", DefaultCreateCluster, "Create a new cluster if it doesn't exist")
@@ -346,9 +360,11 @@ func Parse() *Config {
 	rootCmd.Flags().String("argocd-ui-url", DefaultArgocdUIURL, "Argo CD URL to generate application links in diff output (e.g., https://argocd.example.com)")
 	rootCmd.Flags().Bool("output-app-manifests", DefaultOutputAppManifests, "Write per-application manifest files to the output folder (output/base/ and output/target/)")
 	rootCmd.Flags().Bool("output-branch-manifests", DefaultOutputBranchManifests, "Write all application manifests per branch to a single file (output/base-branch.yaml and output/target-branch.yaml)")
+	rootCmd.Flags().Bool("include-helm-hooks", DefaultIncludeHelmHooks, "Keep resources annotated with helm.sh/hook in the diff and the manifest output files (removed by default)")
 	rootCmd.Flags().Bool("traverse-app-of-apps", DefaultTraverseAppOfApps, "Recursively render child Applications discovered in rendered manifests (app-of-apps pattern). Only supported with --render-method=repo-server-api")
 	rootCmd.Flags().Bool("fail-on-duplicate-generated-applications", DefaultFailOnDuplicateGeneratedApplications, "Fail when a single ApplicationSet generates multiple Applications with the same name")
 	rootCmd.Flags().Bool("skip-appset-generation-errors", DefaultSkipAppSetGenerationErrors, "Skip ApplicationSets that fail to generate (log a warning and continue) instead of aborting the whole run. Useful for ApplicationSets whose generators need cluster secrets or live data unavailable in the ephemeral cluster (e.g. pullRequest/scmProvider generators)")
+	rootCmd.Flags().String("repo-server-address", DefaultRepoServerAddress, "Address of the Argo CD repo server (host:port). Connects directly instead of port-forwarding. Requires --render-method=repo-server-api")
 
 	// Check if version flag was specified directly
 	for _, arg := range os.Args[1:] {
@@ -387,9 +403,6 @@ func (o *RawOptions) checkRequired() []string {
 	if o.TargetBranch == "" {
 		errors = append(errors, "target-branch")
 	}
-	if o.Repo == "" && o.RepoRegex == "" {
-		errors = append(errors, "repo or repo-regex")
-	}
 	if o.Repo != "" && o.RepoRegex != "" {
 		errors = append(errors, "repo and repo-regex are mutually exclusive")
 	}
@@ -409,6 +422,7 @@ func (o *RawOptions) ToConfig() (*Config, error) {
 		TargetBranch:                         o.TargetBranch,
 		OutputFolder:                         o.OutputFolder,
 		SecretsFolder:                        o.SecretsFolder,
+		PreinstallFolder:                     o.PreinstallFolder,
 		CreateCluster:                        o.CreateCluster,
 		ClusterName:                          o.ClusterName,
 		KindOptions:                          o.KindOptions,
@@ -437,9 +451,11 @@ func (o *RawOptions) ToConfig() (*Config, error) {
 		Concurrency:                          o.Concurrency,
 		OutputAppManifests:                   o.OutputAppManifests,
 		OutputBranchManifests:                o.OutputBranchManifests,
+		IncludeHelmHooks:                     o.IncludeHelmHooks,
 		TraverseAppOfApps:                    o.TraverseAppOfApps,
 		FailOnDuplicateGeneratedApplications: o.FailOnDuplicateGeneratedApplications,
 		SkipAppSetGenerationErrors:           o.SkipAppSetGenerationErrors,
+		RepoServerAddress:                    o.RepoServerAddress,
 	}
 
 	var err error
@@ -465,7 +481,9 @@ func (o *RawOptions) ToConfig() (*Config, error) {
 		return nil, fmt.Errorf("invalid file-regex: %w", err)
 	}
 
-	cfg.RepoSelector, err = o.parseRepositorySelector()
+	// Resolve the repository selector, auto-detecting from the checkout
+	// folders when neither --repo nor --repo-regex is provided.
+	cfg.RepoSelector, err = o.parseRepositorySelector(cfg.BaseBranch, cfg.TargetBranch)
 	if err != nil {
 		return nil, err
 	}
@@ -501,11 +519,22 @@ func (o *RawOptions) ToConfig() (*Config, error) {
 		return nil, fmt.Errorf("--traverse-app-of-apps requires --render-method=repo-server-api (current: %s)", cfg.RenderMethod)
 	}
 
+	// Helm hooks are not returned by the Argo CD CLI renderer. They can only be
+	// included when manifests are fetched through one of the API renderers.
+	if cfg.IncludeHelmHooks && cfg.RenderMethod == RenderMethodCLI {
+		return nil, fmt.Errorf("--include-helm-hooks is incompatible with --render-method=cli; use --render-method=server-api or --render-method=repo-server-api")
+	}
+
 	// Check if argocd CLI is installed when not using API mode
 	if cfg.RenderMethod == RenderMethodCLI && !cfg.DryRun {
 		if _, err := exec.LookPath("argocd"); err != nil {
 			return nil, fmt.Errorf("argocd CLI is not installed. Either install the argocd CLI or use '--render-method=server-api' / '--use-argocd-api=true' to use the API instead")
 		}
+	}
+
+	// --repo-server-address is only supported with repo-server-api render method
+	if cfg.RepoServerAddress != "" && cfg.RenderMethod != RenderMethodRepoServerAPI {
+		return nil, fmt.Errorf("--repo-server-address requires --render-method=repo-server-api (current: %s)", cfg.RenderMethod)
 	}
 
 	return cfg, nil
@@ -544,12 +573,39 @@ func (o *RawOptions) parseFileRegex() (*regexp.Regexp, error) {
 	return regexp.Compile(o.FileRegex)
 }
 
-// parseRepositorySelector returns a Repository Selector based on the repo or repo-regex flags
-func (o *RawOptions) parseRepositorySelector() (repository.Selector, error) {
+// parseRepositorySelector returns a Repository Selector based on the repo or
+// repo-regex flags. When neither is set, it auto-detects the repository from
+// the base and target checkout folders (both must share the same origin
+// remote).
+func (o *RawOptions) parseRepositorySelector(baseBranch, targetBranch string) (repository.Selector, error) {
+	if o.Repo == "" && o.RepoRegex == "" {
+		return autoDetectRepositorySelector(baseBranch, targetBranch)
+	}
+
 	repoSelector, err := repository.NewSelector(o.Repo, o.RepoRegex)
 	if err != nil {
 		return repository.Selector{}, fmt.Errorf("invalid repo-regex: %w", err)
 	}
+	return *repoSelector, nil
+}
+
+// autoDetectRepositorySelector returns the owner/repo detected from the origin
+// remote shared by the base and target checkout folders.
+func autoDetectRepositorySelector(baseBranch, targetBranch string) (repository.Selector, error) {
+	baseFolder := git.NewBranch(baseBranch, git.Base).FolderName()
+	targetFolder := git.NewBranch(targetBranch, git.Target).FolderName()
+
+	repo, ok := repository.DetectMatchingOriginRepo(baseFolder, targetFolder)
+	if !ok {
+		return repository.Selector{}, fmt.Errorf("could not auto-detect repository. please provide --repo or --repo-regex")
+	}
+
+	repoSelector, err := repository.NewSelector(repo, "")
+	if err != nil {
+		return repository.Selector{}, fmt.Errorf("invalid auto-detected repository: %w", err)
+	}
+	repoSelector.IsAutoDetected = true
+
 	return *repoSelector, nil
 }
 
@@ -632,23 +688,31 @@ func configureLogging(cfg *Config) {
 	// informers", "Configmap/secret informer synced" from util/settings).
 	logrus.SetOutput(io.Discard)
 
-	consoleWriter := zerolog.ConsoleWriter{Out: os.Stdout, NoColor: true}
 	if cfg.Debug {
 		zerolog.SetGlobalLevel(zerolog.DebugLevel)
-		if cfg.LogFormat == "human" {
-			consoleWriter.TimeFormat = time.RFC1123
-		}
 	} else {
 		zerolog.SetGlobalLevel(zerolog.InfoLevel)
-		if cfg.LogFormat == "human" {
+	}
+	log.Logger = newLogger(cfg, os.Stdout)
+}
+
+// newLogger returns a JSON logger for the json log format, and a console logger otherwise
+func newLogger(cfg *Config, out io.Writer) zerolog.Logger {
+	if cfg.LogFormat == "json" {
+		return zerolog.New(out).With().Timestamp().Logger()
+	}
+
+	consoleWriter := zerolog.ConsoleWriter{Out: out, NoColor: true}
+	if cfg.LogFormat == "human" {
+		if cfg.Debug {
+			consoleWriter.TimeFormat = time.RFC1123
+		} else {
 			consoleWriter.PartsExclude = []string{"time", "level"}
 		}
-	}
-	if cfg.LogFormat == "human" {
 		consoleWriter.FormatFieldName = func(i any) string { return fmt.Sprintf("(%s: ", i) }
 		consoleWriter.FormatFieldValue = func(i any) string { return fmt.Sprintf("%s)", i) }
 	}
-	log.Logger = log.Output(consoleWriter)
+	return log.Output(consoleWriter)
 }
 
 // LogConfig logs all the configuration values
@@ -687,13 +751,18 @@ func (o *Config) LogConfig() {
 	log.Info().Msgf("✨ - base-branch: %s", o.BaseBranch)
 	log.Info().Msgf("✨ - target-branch: %s", o.TargetBranch)
 	log.Info().Msgf("✨ - secrets-folder: %s", o.SecretsFolder)
+	log.Info().Msgf("✨ - preinstall-folder: %s", o.PreinstallFolder)
 	log.Info().Msgf("✨ - output-folder: %s", o.OutputFolder)
 	log.Info().Msgf("✨ - argocd-namespace: %s", o.ArgocdNamespace)
 	if o.ArgocdConfigPath != DefaultArgocdConfigPath {
 		log.Info().Msgf("✨ - argocd-config-dir: %s", o.ArgocdConfigPath)
 	}
 	if o.RepoSelector.Repo != "" {
-		log.Info().Msgf("✨ - repo: %s", o.RepoSelector.Repo)
+		if o.RepoSelector.IsAutoDetected {
+			log.Info().Msgf("✨ - repo: %s (auto-detected)", o.RepoSelector.Repo)
+		} else {
+			log.Info().Msgf("✨ - repo: %s", o.RepoSelector.Repo)
+		}
 	}
 	if o.RepoSelector.Regex != nil {
 		log.Info().Msgf("✨ - repo-regex: %s", o.RepoSelector.Regex.String())
@@ -774,6 +843,9 @@ func (o *Config) LogConfig() {
 	if o.ArgocdUIURL != DefaultArgocdUIURL {
 		log.Info().Msgf("✨ - argocd-ui-url: %s", o.ArgocdUIURL)
 	}
+	if o.RepoServerAddress != DefaultRepoServerAddress {
+		log.Info().Msgf("✨ - repo-server-address: %s", o.RepoServerAddress)
+	}
 	if o.Title != DefaultTitle {
 		log.Info().Msgf("✨ - title: %s", o.Title)
 	}
@@ -798,6 +870,9 @@ func (o *Config) LogConfig() {
 	}
 	if o.OutputBranchManifests {
 		log.Info().Msgf("✨ - output-branch-manifests: %t", o.OutputBranchManifests)
+	}
+	if o.IncludeHelmHooks {
+		log.Info().Msgf("✨ - include-helm-hooks: %t", o.IncludeHelmHooks)
 	}
 	if o.TraverseAppOfApps {
 		log.Info().Msgf("✨ - traverse-app-of-apps: %t", o.TraverseAppOfApps)

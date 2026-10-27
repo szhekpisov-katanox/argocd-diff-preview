@@ -15,6 +15,7 @@ package reposerverextract
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -43,11 +44,12 @@ import (
 // resourceInfoProvider implements kubeutil.ResourceInfoProvider to supply
 // namespace-scope information for Kubernetes resources.
 type resourceInfoProvider struct {
-	namespacedByGk map[schema.GroupKind]bool
+	clusterScopedByGk map[schema.GroupKind]bool
 }
 
 func (p *resourceInfoProvider) IsNamespaced(gk schema.GroupKind) (bool, error) {
-	return p.namespacedByGk[gk], nil
+	_, isClusterScoped := p.clusterScopedByGk[gk]
+	return !isClusterScoped, nil
 }
 
 // RenderApplicationsFromBothBranches renders manifests for all supplied base
@@ -93,7 +95,7 @@ func RenderApplicationsFromBothBranches(
 		return nil, nil, time.Since(startTime), err
 	}
 
-	namespacedScopedResources, apiVersions, err := argocd.K8sClient.GetNamespacedScopedResourcesAndAPIVersions()
+	clusterScopedResources, apiVersions, err := argocd.K8sClient.GetClusterScopedResourcesAndAPIVersions()
 	if err != nil {
 		return nil, nil, time.Since(startTime), fmt.Errorf("failed to initialize render context: %w", err)
 	}
@@ -101,6 +103,17 @@ func RenderApplicationsFromBothBranches(
 	kubeVersion, err := argocd.K8sClient.GetServerVersion()
 	if err != nil {
 		return nil, nil, time.Since(startTime), fmt.Errorf("failed to get server version: %w", err)
+	}
+
+	// Mirror Argo CD's API server: pass the global kustomize build options from argocd-cm on every request;
+	// the repo server never reads the ConfigMap. Missing ConfigMap access must not prevent rendering,
+	// but applications that depend on global Kustomize options may then fail to render.
+	kustomizeBuildOptions, err := argocd.K8sClient.GetConfigMapValue(argocd.Namespace, "argocd-cm", "kustomize.buildOptions")
+	if err != nil {
+		log.Warn().Err(err).Msg("⚠️ Unable to read kustomize.buildOptions from argocd-cm. Continuing without global Kustomize options; applications that depend on them may fail to render.")
+		kustomizeBuildOptions = ""
+	} else if kustomizeBuildOptions != "" {
+		log.Info().Msgf("🔧 Using kustomize build options from argocd-cm: %s", kustomizeBuildOptions)
 	}
 
 	// Collect all unique repository URLs referenced by the Applications so that
@@ -111,19 +124,24 @@ func RenderApplicationsFromBothBranches(
 	// The repo server has no access to Kubernetes secrets - credentials must be
 	// provided by the caller in every ManifestRequest. We mirror what the
 	// ArgoCD app controller does in controller/state.go before calling the repo server.
-	creds, err := FetchRepoCreds(context.Background(), argocd.K8sClient, argocd.Namespace, appRepoURLs)
+	creds, err := FetchRepoCredsWithTimeout(context.Background(), repoCredsFetchTimeout, argocd.K8sClient, argocd.Namespace, appRepoURLs)
 	if err != nil {
 		return nil, nil, time.Since(startTime), fmt.Errorf("failed to fetch repository credentials: %w", err)
 	}
 
 	// Create a single repo server client shared across all goroutines.
 	// EnsurePortForward is idempotent and mutex-protected inside the client.
-	repoClient := reposerver.NewClient(argocd.K8sClient, argocd.Namespace)
-	defer repoClient.Cleanup()
-
-	if err := repoClient.EnsurePortForward(); err != nil {
-		return nil, nil, time.Since(startTime), fmt.Errorf("failed to set up port forward to repo server: %w", err)
+	var repoClient *reposerver.Client
+	if argocd.RepoServerAddress != "" {
+		log.Info().Msgf("🔌 Connecting directly to Argo CD repo server at %s", argocd.RepoServerAddress)
+		repoClient = reposerver.NewClientWithAddress(argocd.RepoServerAddress, false, true)
+	} else {
+		repoClient = reposerver.NewClient(argocd.K8sClient, argocd.Namespace)
+		if err := repoClient.EnsurePortForward(); err != nil {
+			return nil, nil, time.Since(startTime), fmt.Errorf("failed to set up port forward to repo server: %w", err)
+		}
 	}
+	defer repoClient.Cleanup()
 
 	allApps := append(baseApps, targetApps...)
 
@@ -182,7 +200,7 @@ func RenderApplicationsFromBothBranches(
 			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(remainingTime())*time.Second)
 			defer cancel()
 
-			manifests, err := renderApp(ctx, repoClient, app, branchFolderByType, namespacedScopedResources, creds, &repoSelector, kubeVersion, apiVersions, helmChartPuller{})
+			manifests, err := renderApp(ctx, repoClient, app, branchFolderByType, clusterScopedResources, creds, &repoSelector, kubeVersion, apiVersions, kustomizeBuildOptions, helmChartPuller{})
 			if err != nil {
 				results <- result{err: fmt.Errorf("failed to render app %s: %w", app.GetLongName(), err)}
 				return
@@ -254,11 +272,12 @@ func renderApp(
 	repoClient *reposerver.Client,
 	app argoapplication.ArgoResource,
 	branchFolderByType map[git.BranchType]string,
-	namespacedScopedResources map[schema.GroupKind]bool,
+	clusterScopedResources map[schema.GroupKind]bool,
 	creds *RepoCreds,
 	repoSelector *repository.Selector,
 	kubeVersion string,
 	apiVersions []string,
+	kustomizeBuildOptions string,
 	puller chartPuller,
 ) ([]unstructured.Unstructured, error) {
 	branchFolder, ok := branchFolderByType[app.Branch]
@@ -282,10 +301,11 @@ func renderApp(
 			branchFolder,
 			creds,
 			manifestRequestRenderContext{
-				repoSelector: repoSelector,
-				kubeVersion:  kubeVersion,
-				apiVersions:  apiVersions,
-				puller:       puller,
+				repoSelector:          repoSelector,
+				kubeVersion:           kubeVersion,
+				apiVersions:           apiVersions,
+				kustomizeBuildOptions: kustomizeBuildOptions,
+				puller:                puller,
 			},
 		)
 		if err != nil {
@@ -366,20 +386,12 @@ func renderApp(
 	}
 
 	destNamespace, _, _ := unstructured.NestedString(app.Yaml.Object, "spec", "destination", "namespace")
-	manifests, err = normalizeNamespaces(manifests, destNamespace, namespacedScopedResources, app.GetLongName())
+	manifests, err = normalizeNamespaces(manifests, destNamespace, clusterScopedResources, app.GetLongName())
 	if err != nil {
 		return nil, err
 	}
 
-	// Filter out Helm hook resources (reuse the exported helper from extract).
-	filtered := make([]unstructured.Unstructured, 0, len(manifests))
-	for _, m := range manifests {
-		if extract.HelmHookFilter(m) {
-			filtered = append(filtered, m)
-		}
-	}
-
-	return filtered, nil
+	return manifests, nil
 }
 
 // collectRepoURLs extracts all unique repository URLs referenced by the given
@@ -524,6 +536,10 @@ type manifestRequestRenderContext struct {
 	repoSelector *repository.Selector
 	kubeVersion  string
 	apiVersions  []string
+	// kustomizeBuildOptions holds the global `kustomize.buildOptions` value
+	// from argocd-cm. Argo CD's API server passes it to the repo server on
+	// every request; the repo server never reads the ConfigMap itself.
+	kustomizeBuildOptions string
 	// puller fetches remote Helm charts so they can be streamed to the repo
 	// server together with same-repo $ref value files. When nil, remote charts
 	// with ref sources fall back to the unary GenerateManifest RPC.
@@ -552,7 +568,7 @@ func buildManifestRequestForSource(
 	namespace, _, _ := unstructured.NestedString(obj, append(specPath, "destination", "namespace")...)
 
 	newManifestRequest := func(source *v1alpha1.ApplicationSource) *repoapiclient.ManifestRequest {
-		return &repoapiclient.ManifestRequest{
+		request := &repoapiclient.ManifestRequest{
 			Repo:               creds.GetRepo(source.RepoURL),
 			Repos:              creds.HelmRepos(source),
 			HelmRepoCreds:      creds.HelmRepoCreds(source),
@@ -570,6 +586,12 @@ func buildManifestRequestForSource(
 			ProjectName:        "default",
 			ProjectSourceRepos: []string{"*"},
 		}
+		if renderContext.kustomizeBuildOptions != "" {
+			request.KustomizeOptions = &v1alpha1.KustomizeOptions{
+				BuildOptions: renderContext.kustomizeBuildOptions,
+			}
+		}
+		return request
 	}
 
 	// Fast path: no ref sources.
@@ -607,6 +629,15 @@ func buildManifestRequestForSource(
 		}
 		streamDir, cleanup, err := buildStreamDirForLocalSource(branchFolder, primarySource)
 		if err != nil {
+			if isLocalSourceMissing(err) {
+				log.Warn().
+					Str("App", app.GetLongName()).
+					Str("sourceRepoURL", primarySource.RepoURL).
+					Str("sourcePath", primarySource.Path).
+					Str("branchFolder", branchFolder).
+					Msg("⚠️ PR repo source is not present in the local branch folder - using remote RPC")
+				return newManifestRequest(&primarySource), "", nil, nil
+			}
 			return nil, "", nil, err
 		}
 		requestSource := primarySource
@@ -643,6 +674,16 @@ func buildManifestRequestForSource(
 	// from its own git cache.
 	if primarySource.Chart != "" {
 		if renderContext.puller != nil && !hasExternalRefSource(refSources, renderContext.repoSelector) {
+			if available, reason := localRefSourcesAvailable(branchFolder, primarySource, refSources); !available {
+				log.Warn().
+					Str("App", app.GetLongName()).
+					Str("branchFolder", branchFolder).
+					Str("reason", reason).
+					Msg("⚠️ PR repo ref source is not present in the local branch folder - using remote RPC")
+				request = newManifestRequest(&primarySource)
+				request.RefSources = buildRefSourcesMap(refSources, creds)
+				return request, "", nil, nil
+			}
 			return buildRemoteChartLocalRefsRequest(
 				app, primarySource, refSources, branchFolder, creds, renderContext.puller, newManifestRequest)
 		}
@@ -670,6 +711,28 @@ func buildManifestRequestForSource(
 		return request, "", nil, nil
 	}
 
+	if available, reason := localContentAndRefSourcesAvailable(branchFolder, primarySource, refSources); !available {
+		log.Warn().
+			Str("App", app.GetLongName()).
+			Str("sourceRepoURL", primarySource.RepoURL).
+			Str("branchFolder", branchFolder).
+			Str("reason", reason).
+			Msg("⚠️ PR repo source is not present in the local branch folder - using remote RPC")
+		request = newManifestRequest(&primarySource)
+		request.RefSources = buildRefSourcesMap(refSources, creds)
+		return request, "", nil, nil
+	}
+
+	// Kustomize can reference directories outside the source path. Stream the
+	// existing checkout directly, as on the no-refs path, so those directories
+	// remain available without creating and recompressing a per-request copy of
+	// the whole checkout. Ref sources are only used by Helm value files and file
+	// parameters, so a Kustomize source does not need the .refs staging tree.
+	srcContentDir := filepath.Join(branchFolder, primarySource.Path)
+	if isKustomizeSource(srcContentDir) {
+		return newManifestRequest(&primarySource), branchFolder, nil, nil
+	}
+
 	//   <tempDir>/<primarySource.Path>/  ← content source files
 	//   <tempDir>/.refs/<refName>/       ← files for each ref source
 	tempDir, err := os.MkdirTemp("", "argocd-diff-preview-*")
@@ -683,15 +746,15 @@ func buildManifestRequestForSource(
 	}
 
 	// Copy the content source directory into the temp tree.
-	srcContentDir := filepath.Join(branchFolder, primarySource.Path)
 	dstContentDir := filepath.Join(tempDir, primarySource.Path)
 	if err := copyDir(srcContentDir, dstContentDir); err != nil {
 		cleanup()
 		return nil, "", nil, fmt.Errorf("failed to copy content source dir %q: %w", srcContentDir, err)
 	}
 
-	// Copy each ref source into <tempDir>/.refs/<refName>/.
-	refDirs, err := stageRefSources(tempDir, branchFolder, refSources)
+	// Copy only the ref files used by this content source into
+	// <tempDir>/.refs/<refName>/.
+	refDirs, err := stageRefSources(tempDir, branchFolder, refSources, primarySource)
 	if err != nil {
 		cleanup()
 		return nil, "", nil, err
@@ -743,8 +806,8 @@ func buildRemoteChartLocalRefsRequest(
 		return nil, "", nil, fmt.Errorf("failed to pull chart for app %s: %w", app.GetLongName(), err)
 	}
 
-	// Stage the same-repo ref sources next to the chart.
-	refDirs, err := stageRefSources(tempDir, branchFolder, refSources)
+	// Stage the same-repo ref files used by the chart.
+	refDirs, err := stageRefSources(tempDir, branchFolder, refSources, primarySource)
 	if err != nil {
 		cleanup()
 		return nil, "", nil, err
@@ -775,33 +838,103 @@ func buildRemoteChartLocalRefsRequest(
 	return newManifestRequest(&rewrittenSource), tempDir, cleanup, nil
 }
 
-// stageRefSources copies each ref source's directory into
-// <tempDir>/.refs/<refName>/ and returns a map of ref name to absolute local
-// directory. A ref source with an empty Path points at the repository root
-// (branchFolder).
-func stageRefSources(tempDir, branchFolder string, refSources []v1alpha1.ApplicationSource) (map[string]string, error) {
+// stageRefSources stages only the Helm value files and file parameters that
+// reference another source. A ref source with an empty Path still resolves
+// paths from the repository root, but unrelated repository files are not
+// copied into the streamed archive.
+func stageRefSources(tempDir, branchFolder string, refSources []v1alpha1.ApplicationSource, primarySource v1alpha1.ApplicationSource) (map[string]string, error) {
 	refDirs := make(map[string]string, len(refSources))
+	refsByName := make(map[string]v1alpha1.ApplicationSource, len(refSources))
 	for _, ref := range refSources {
-		refDir := filepath.Join(tempDir, ".refs", ref.Ref)
-		srcRefDir := filepath.Join(branchFolder, ref.Path)
-		if ref.Path == "" {
-			// Ref-only source with no path points at the repo root.
-			srcRefDir = branchFolder
+		refsByName[ref.Ref] = ref
+		refDirs[ref.Ref] = filepath.Join(tempDir, ".refs", ref.Ref)
+	}
+	if primarySource.Helm == nil {
+		return refDirs, nil
+	}
+
+	type refPathToStage struct {
+		path            string
+		ignoreIfMissing bool
+	}
+	refPaths := make([]refPathToStage, 0, len(primarySource.Helm.ValueFiles)+len(primarySource.Helm.FileParameters))
+	for _, valueFile := range primarySource.Helm.ValueFiles {
+		refPaths = append(refPaths, refPathToStage{path: valueFile, ignoreIfMissing: primarySource.Helm.IgnoreMissingValueFiles})
+	}
+	for _, fileParameter := range primarySource.Helm.FileParameters {
+		refPaths = append(refPaths, refPathToStage{path: fileParameter.Path})
+	}
+	stagedFiles := map[string]struct{}{}
+	fullyStagedRefs := map[string]struct{}{}
+	for _, refPathToStage := range refPaths {
+		refValuePath := refPathToStage.path
+		refName, refPath, ok := splitRefPath(refValuePath)
+		if !ok {
+			if strings.HasPrefix(refValuePath, "$") {
+				return nil, fmt.Errorf("invalid ref path %q", refValuePath)
+			}
+			continue
 		}
-		if err := copyDir(srcRefDir, refDir); err != nil {
-			return nil, fmt.Errorf("failed to copy ref source %q: %w", ref.Ref, err)
+		ref, found := refsByName[refName]
+		if !found {
+			return nil, fmt.Errorf("ref path %q references unknown ref %q", refValuePath, refName)
 		}
-		refDirs[ref.Ref] = refDir
+		if _, staged := fullyStagedRefs[refName]; staged {
+			continue
+		}
+
+		refRoot := localRefSourceRoot(branchFolder, ref)
+		// Argo CD expands variables in ref paths during rendering. Keep the
+		// existing full-ref behavior for dynamic paths because their final file
+		// name is not known while staging.
+		if strings.Contains(refPath, "$") {
+			if err := copyDir(refRoot, refDirs[refName]); err != nil {
+				return nil, fmt.Errorf("failed to stage dynamic ref source %q: %w", refName, err)
+			}
+			fullyStagedRefs[refName] = struct{}{}
+			continue
+		}
+
+		srcFile, relPath, err := resolveRefFilePath(refRoot, refPath)
+		if err != nil {
+			return nil, fmt.Errorf("invalid ref path %q for source %q: %w", refValuePath, refName, err)
+		}
+		if _, err := os.Stat(srcFile); err != nil {
+			if refPathToStage.ignoreIfMissing && errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, fmt.Errorf("failed to inspect ref path %q from source %q: %w", refValuePath, refName, err)
+		}
+		stagingKey := refName + "\x00" + relPath
+		if _, staged := stagedFiles[stagingKey]; staged {
+			continue
+		}
+		if err := copyFile(srcFile, filepath.Join(refDirs[refName], relPath)); err != nil {
+			return nil, fmt.Errorf("failed to stage ref path %q from source %q: %w", refValuePath, refName, err)
+		}
+		stagedFiles[stagingKey] = struct{}{}
 	}
 	return refDirs, nil
 }
 
-// rewriteRefValueFiles returns a copy of source whose Helm $ref/… value-file
-// paths are rewritten to filesystem paths relative to appDirAbs, resolved
-// against the staged ref directories in refDirs. Non-$ref value files are left
-// untouched, and a source with no Helm config is returned unchanged. The
-// returned source carries a fresh Helm copy, so the caller's source is not
-// mutated.
+func resolveRefFilePath(refRoot, refPath string) (string, string, error) {
+	if filepath.IsAbs(refPath) {
+		return "", "", errors.New("absolute paths are not allowed")
+	}
+	srcFile := filepath.Join(refRoot, refPath)
+	relPath, err := filepath.Rel(refRoot, srcFile)
+	if err != nil {
+		return "", "", err
+	}
+	if relPath == ".." || strings.HasPrefix(relPath, ".."+string(os.PathSeparator)) {
+		return "", "", errors.New("path escapes the ref source root")
+	}
+	return srcFile, relPath, nil
+}
+
+// rewriteRefValueFiles returns a copy of source whose Helm $ref paths are
+// rewritten to filesystem paths relative to appDirAbs. Value files and file
+// parameters that do not use refs are left untouched.
 func rewriteRefValueFiles(
 	source v1alpha1.ApplicationSource,
 	appDirAbs string,
@@ -833,6 +966,26 @@ func rewriteRefValueFiles(
 	}
 	helmCopy := *source.Helm
 	helmCopy.ValueFiles = rewritten
+	helmCopy.FileParameters = append([]v1alpha1.HelmFileParameter(nil), source.Helm.FileParameters...)
+	for i := range helmCopy.FileParameters {
+		fileParameter := &helmCopy.FileParameters[i]
+		if !strings.HasPrefix(fileParameter.Path, "$") {
+			continue
+		}
+		refName, refPath, ok := splitRefPath(fileParameter.Path)
+		if !ok {
+			continue
+		}
+		refLocalDir, known := refDirs[refName]
+		if !known {
+			return source, fmt.Errorf("file parameter %q references unknown ref %q in app %s", fileParameter.Path, refName, appLongName)
+		}
+		relPath, err := filepath.Rel(appDirAbs, filepath.Join(refLocalDir, refPath))
+		if err != nil {
+			return source, fmt.Errorf("failed to compute relative path for ref file parameter: %w", err)
+		}
+		fileParameter.Path = relPath
+	}
 	source.Helm = &helmCopy
 	return source, nil
 }
@@ -975,6 +1128,12 @@ func copyDir(src, dst string) error {
 		if err != nil {
 			return err
 		}
+		// Git metadata is never rendered and can be much larger than the
+		// working tree. The tarball compressor excludes it too, but skipping it
+		// here prevents needless temporary-disk I/O during staging.
+		if info.IsDir() && info.Name() == ".git" {
+			return filepath.SkipDir
+		}
 		rel, err := filepath.Rel(src, srcPath)
 		if err != nil {
 			return err
@@ -1099,19 +1258,15 @@ func removeArgoCDTrackingID(manifests []unstructured.Unstructured) error {
 func normalizeNamespaces(
 	manifests []unstructured.Unstructured,
 	destNamespace string,
-	namespacedResources map[schema.GroupKind]bool,
+	clusterScopedResources map[schema.GroupKind]bool,
 	appName string,
 ) ([]unstructured.Unstructured, error) {
-	if destNamespace == "" {
-		return manifests, nil
-	}
-
 	ptrManifests := make([]*unstructured.Unstructured, len(manifests))
 	for i := range manifests {
 		ptrManifests[i] = &manifests[i]
 	}
 
-	provider := &resourceInfoProvider{namespacedByGk: namespacedResources}
+	provider := &resourceInfoProvider{clusterScopedByGk: clusterScopedResources}
 	deduped, conditions, err := controller.DeduplicateTargetObjects(destNamespace, ptrManifests, provider)
 	if err != nil {
 		return nil, fmt.Errorf("failed to normalise namespaces: %w", err)
