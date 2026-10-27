@@ -66,6 +66,7 @@ type TestCase struct {
 	ArgocdConfigDirAPIMode     string // Custom argocd-config directory for API render modes; falls back to ArgocdConfigDir when empty
 	ArgocdUIURL                string // Argo CD URL for generating application links in diff output
 	TraverseAppOfApps          string // If "true", enables recursive child app discovery (--traverse-app-of-apps)
+	IncludeHelmHooks           string // If "true", keeps helm.sh/hook resources in the output (--include-helm-hooks)
 	RepoRegex                  string // If set, use --repo-regex instead of --repo
 	ExpectFailure              bool   // If true, the test is expected to fail
 }
@@ -108,9 +109,20 @@ var testCases = []TestCase{
 		ArgocdUIURL:        "https://argocd.example.com",
 	},
 	{
-		Name:         "branch-2/target",
+		Name:         "branch-2/target-1",
 		TargetBranch: "integration-test/branch-2/target",
 		BaseBranch:   "integration-test/branch-2/base",
+		Suffix:       "-1",
+	},
+	// Same branches with --include-helm-hooks: the chart's helm test hook Pod is
+	// renamed along with the Deployment and now shows up in the diff.
+	{
+		Name:             "branch-2/target-2",
+		TargetBranch:     "integration-test/branch-2/target",
+		BaseBranch:       "integration-test/branch-2/base",
+		Suffix:           "-2",
+		IncludeHelmHooks: "true",
+		RenderMethod:     "server-api",
 	},
 	{
 		Name:         "branch-3/target",
@@ -131,6 +143,9 @@ var testCases = []TestCase{
 		FilesChanged:               "examples/helm/values/filtered.yaml",
 		WatchIfNoWatchPatternFound: "false",
 	},
+	// Also covers same-repository root $ref staging. The small repo-server
+	// archive limit only passes when the referenced values file is staged instead
+	// of copying the entire repository into .refs/local-files.
 	{
 		Name:                       "branch-5/target-2",
 		TargetBranch:               "integration-test/branch-5/target",
@@ -138,6 +153,8 @@ var testCases = []TestCase{
 		Suffix:                     "-2",
 		FilesChanged:               "examples/helm/applications/watch-pattern/valid-regex.yaml",
 		WatchIfNoWatchPatternFound: "false",
+		RenderMethod:               "repo-server-api",
+		ArgocdConfigDir:            "ref-staging-size-limit",
 	},
 	{
 		Name:                       "branch-5/target-3",
@@ -337,6 +354,35 @@ var testCases = []TestCase{
 		BaseBranch:                 "integration-test/branch-18/base",
 		RenderMethod:               "repo-server-api",
 		FileRegex:                  "examples/out-of-chart-values/.*",
+		WatchIfNoWatchPatternFound: "false",
+	},
+	// Regression test for global Kustomize build options in repo-server-api mode.
+	// The Kustomization loads a resource outside its application directory, which
+	// requires kustomize.buildOptions=--load-restrictor LoadRestrictionsNone.
+	// This test also covers resource ownership across Application sections:
+	// duplicate cluster-scoped resources in one Application, a resource genuinely
+	// moved from one Application to another, and an unchanged resource that must
+	// remain associated with its original Application without producing a diff.
+	{
+		Name:                       "branch-19/target",
+		TargetBranch:               "integration-test/branch-19/target",
+		BaseBranch:                 "integration-test/branch-19/base",
+		RenderMethod:               "repo-server-api",
+		ArgocdConfigDir:            "kustomize-build-options",
+		FileRegex:                  "examples/(kustomize-build-options|resource-application-boundary|cluster-rbac-repro)/.*",
+		WatchIfNoWatchPatternFound: "false",
+	},
+	// Regression test for kind-level .Capabilities.APIVersions entries in
+	// repo-server-api mode. The chart gates a ServiceMonitor on
+	// "monitoring.coreos.com/v1/ServiceMonitor", which Argo CD includes next to
+	// the group version. The target enables it, so the diff must show it added.
+	{
+		Name:                       "branch-21/target",
+		TargetBranch:               "integration-test/branch-21/target",
+		BaseBranch:                 "integration-test/branch-21/base",
+		RenderMethod:               "repo-server-api",
+		ArgocdConfigDir:            "with-servicemonitor-crd-no-cluster-roles",
+		FileRegex:                  "examples/kind-level-capabilities/.*",
 		WatchIfNoWatchPatternFound: "false",
 	},
 	// This test verifies that disabling cluster roles without using the API fails.
@@ -815,9 +861,11 @@ func buildDockerImage() error {
 	}
 	cmd := exec.Command("docker", "build", "-f", "Dockerfile", "-t", *dockerImage, ".")
 	cmd.Dir = repoRoot
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("docker build failed: %w\nDocker build output:\n%s", err, output)
+	}
+	return nil
 }
 
 // runWithGoBinary executes the test using the Go binary
@@ -991,6 +1039,10 @@ func runWithDocker(tc TestCase, createCluster bool, runDirs RunDirs) error {
 		args = append(args, "-e", "TRAVERSE_APP_OF_APPS=true")
 	}
 
+	if tc.IncludeHelmHooks == "true" {
+		args = append(args, "-e", "INCLUDE_HELM_HOOKS=true")
+	}
+
 	// Add image (no additional args needed - all config is via env vars)
 	args = append(args, *dockerImage)
 
@@ -1091,6 +1143,10 @@ func buildArgs(tc TestCase, createCluster bool, runDirs RunDirs, repoRoot string
 
 	if tc.TraverseAppOfApps == "true" {
 		args = append(args, "--traverse-app-of-apps")
+	}
+
+	if tc.IncludeHelmHooks == "true" {
+		args = append(args, "--include-helm-hooks")
 	}
 
 	// When the test requires cluster roles to be disabled (API mode or DisableClusterRoles flag),

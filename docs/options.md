@@ -35,6 +35,7 @@ argocd-diff-preview [FLAGS] [OPTIONS] (--repo <repo> | --repo-regex <regex>) --t
 | `--version`, `-v`                   | -                                 | -       | Prints version information                                                                                                       |
 | `--output-app-manifests`            | `OUTPUT_APP_MANIFESTS`            | `false` | Write each application's manifests to its own file under `output/base/` and `output/target/`                                     |
 | `--output-branch-manifests`         | `OUTPUT_BRANCH_MANIFESTS`         | `false` | Write all application manifests per branch into a single file (`output/base-branch.yaml` and `output/target-branch.yaml`)        |
+| `--include-helm-hooks`              | `INCLUDE_HELM_HOOKS`              | `false` | Keep resources annotated with `helm.sh/hook` in the diff and the manifest output files                                          |
 
 ## Options
 
@@ -65,9 +66,11 @@ argocd-diff-preview [FLAGS] [OPTIONS] (--repo <repo> | --repo-regex <regex>) --t
 | `--log-format <format>`                   | `LOG_FORMAT`                 | `human`                                | Log format. Options: `human`, `json`                                                        |
 | `--max-diff-length <length>`              | `MAX_DIFF_LENGTH`            | `65536`                                | Max diff message character count (only limits the generated Markdown file)                  |
 | `--output-folder <folder>`, `-o`          | `OUTPUT_FOLDER`              | `./output`                             | Output folder where the diff will be saved                                                  |
+| `--preinstall-folder <folder>`            | `PREINSTALL_FOLDER`          | `./preinstall`                         | Folder containing Kubernetes manifests to apply before Argo CD is installed                 |
 | `--redirect-target-revisions <revs>`      | `REDIRECT_TARGET_REVISIONS`  | -                                      | Comma-separated source targetRevision values to redirect to the target branch. Example: main,HEAD. By default, every targetRevision in matching repositories is redirected |
 | `--render-method <method>`                | `RENDER_METHOD`              | `server-api`                           | Manifest rendering method. Options: `cli`, `server-api`, `repo-server-api`                  |
 | `--repo-regex <regex>`                    | `REPO_REGEX`                 | -                                      | Advanced repository matcher for templated Argo CD repoURL values. Mutually exclusive with `--repo` |
+| `--repo-server-address <address>`                         | `REPO_SERVER_ADDRESS`                      | -                 | Address of the Argo CD repo server (host:port). Connects directly instead of port-forwarding. Requires --render-method=repo-server-api"                                                        |
 | `--secrets-folder <folder>`, `-s`         | `SECRETS_FOLDER`             | `./secrets`                            | Secrets folder where the secrets are read from                                              |
 | `--selector <selector>`, `-l`             | `SELECTOR`                   | -                                      | Label selector to filter on (e.g., `key1=value1,key2=value2`)                               |
 | `--timeout <seconds>`                     | `TIMEOUT`                    | `180`                                  | Set timeout in seconds                                                                      |

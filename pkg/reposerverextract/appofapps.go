@@ -162,7 +162,7 @@ func RenderApplicationsFromBothBranchesWithAppOfApps(
 		return nil, nil, time.Since(startTime), err
 	}
 
-	namespacedScopedResources, apiVersions, err := argocd.K8sClient.GetNamespacedScopedResourcesAndAPIVersions()
+	clusterScopedResources, apiVersions, err := argocd.K8sClient.GetClusterScopedResourcesAndAPIVersions()
 	if err != nil {
 		return nil, nil, time.Since(startTime), fmt.Errorf("failed to initialize render context: %w", err)
 	}
@@ -170,6 +170,15 @@ func RenderApplicationsFromBothBranchesWithAppOfApps(
 	kubeVersion, err := argocd.K8sClient.GetServerVersion()
 	if err != nil {
 		return nil, nil, time.Since(startTime), fmt.Errorf("failed to get server version: %w", err)
+	}
+
+	// Mirror Argo CD's API server: pass the global kustomize build options from argocd-cm on every request;
+	// the repo server never reads the ConfigMap. Missing ConfigMap access must not prevent rendering,
+	// but applications that depend on global Kustomize options may then fail to render.
+	kustomizeBuildOptions, err := argocd.K8sClient.GetConfigMapValue(argocd.Namespace, "argocd-cm", "kustomize.buildOptions")
+	if err != nil {
+		log.Warn().Err(err).Msg("⚠️ Unable to read kustomize.buildOptions from argocd-cm. Continuing without global Kustomize options; applications that depend on them may fail to render.")
+		kustomizeBuildOptions = ""
 	}
 
 	// Collect all unique repository URLs referenced by the Applications so that
@@ -180,19 +189,24 @@ func RenderApplicationsFromBothBranchesWithAppOfApps(
 	// The repo server has no access to Kubernetes secrets - credentials must be
 	// provided by the caller in every ManifestRequest. We mirror what the
 	// ArgoCD app controller does in controller/state.go before calling the repo server.
-	creds, err := FetchRepoCreds(context.Background(), argocd.K8sClient, argocd.Namespace, appRepoURLs)
+	creds, err := FetchRepoCredsWithTimeout(context.Background(), repoCredsFetchTimeout, argocd.K8sClient, argocd.Namespace, appRepoURLs)
 	if err != nil {
 		return nil, nil, time.Since(startTime), fmt.Errorf("failed to fetch repository credentials: %w", err)
 	}
 
 	// Create a single repo server client shared across all goroutines.
 	// EnsurePortForward is idempotent and mutex-protected inside the client.
-	repoClient := reposerver.NewClient(argocd.K8sClient, argocd.Namespace)
-	defer repoClient.Cleanup()
-
-	if err := repoClient.EnsurePortForward(); err != nil {
-		return nil, nil, time.Since(startTime), fmt.Errorf("failed to set up port forward to repo server: %w", err)
+	var repoClient *reposerver.Client
+	if argocd.RepoServerAddress != "" {
+		log.Info().Msgf("🔌 Connecting directly to Argo CD repo server at %s", argocd.RepoServerAddress)
+		repoClient = reposerver.NewClientWithAddress(argocd.RepoServerAddress, false, true)
+	} else {
+		repoClient = reposerver.NewClient(argocd.K8sClient, argocd.Namespace)
+		if err := repoClient.EnsurePortForward(); err != nil {
+			return nil, nil, time.Since(startTime), fmt.Errorf("failed to set up port forward to repo server: %w", err)
+		}
 	}
+	defer repoClient.Cleanup()
 
 	log.Info().Msgf("🤖 Rendering Applications via repo server with app-of-apps traversal (timeout in %d seconds)", timeout)
 
@@ -353,7 +367,7 @@ func RenderApplicationsFromBothBranchesWithAppOfApps(
 			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(remainingTime())*time.Second)
 			defer cancel()
 
-			manifests, childApps, err := renderAppWithChildDiscovery(ctx, repoClient, argocd, item.app, branchFolderByType, branchByType, namespacedScopedResources, creds, &repoSelector, argocd.Namespace, tempFolder, item.depth, kubeVersion, apiVersions, redirectRevisions)
+			manifests, childApps, err := renderAppWithChildDiscovery(ctx, repoClient, argocd, item.app, branchFolderByType, branchByType, clusterScopedResources, creds, &repoSelector, argocd.Namespace, tempFolder, item.depth, kubeVersion, apiVersions, kustomizeBuildOptions, redirectRevisions)
 			if err != nil {
 				results <- renderResult{err: fmt.Errorf("failed to render app %s: %w", item.app.GetLongName(), err)}
 				return
@@ -435,7 +449,7 @@ func renderAppWithChildDiscovery(
 	app argoapplication.ArgoResource,
 	branchFolderByType map[git.BranchType]string,
 	branchByType map[git.BranchType]*git.Branch,
-	namespacedScopedResources map[schema.GroupKind]bool,
+	clusterScopedResources map[schema.GroupKind]bool,
 	creds *RepoCreds,
 	repoSelector *repository.Selector,
 	argocdNamespace string,
@@ -443,9 +457,10 @@ func renderAppWithChildDiscovery(
 	depth int,
 	kubeVersion string,
 	apiVersions []string,
+	kustomizeBuildOptions string,
 	redirectRevisions []string,
 ) ([]unstructured.Unstructured, []argoapplication.ArgoResource, error) {
-	allManifests, err := renderApp(ctx, repoClient, app, branchFolderByType, namespacedScopedResources, creds, repoSelector, kubeVersion, apiVersions, helmChartPuller{})
+	allManifests, err := renderApp(ctx, repoClient, app, branchFolderByType, clusterScopedResources, creds, repoSelector, kubeVersion, apiVersions, kustomizeBuildOptions, helmChartPuller{})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -458,7 +473,7 @@ func renderAppWithChildDiscovery(
 	var childApps []argoapplication.ArgoResource
 
 	for _, m := range allManifests {
-		if !strings.HasPrefix(m.GetAPIVersion(), "argoproj.io/") {
+		if !strings.HasPrefix(m.GetAPIVersion(), "argoproj.io/") || !extract.HelmHookFilter(m) {
 			continue
 		}
 
